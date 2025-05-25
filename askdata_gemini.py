@@ -21,20 +21,9 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     distance = r_metres * c
     return distance
 
-# --- Updated Function to Convert Negative Values in Specific Columns ---
+# ---  Function to Convert Negative Values in Specific Columns ---
 def convert_negatives_to_half_positive(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Converts negative numerical values to half of their absolute value
-    in columns whose names end with 'ppm' or 'pct' (case-insensitive).
-    For example, -5 becomes 2.5 in a column named 'Gold_ppm'.
-    Modifies the DataFrame in place and returns it.
 
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-
-    Returns:
-        pd.DataFrame: The DataFrame with specified negative values converted.
-    """
     for col in df.columns:
         # Check if column is numeric AND its name ends with 'ppm' or 'pct' (case-insensitive)
         if pd.api.types.is_numeric_dtype(df[col]) and \
@@ -210,12 +199,7 @@ if __name__ == "__main__":
         if user_question.lower() == 'exit': print("Exiting analyser. Goodbye!"); break
         if not user_question: continue
 
-        # Example of how you might call the new function if needed before sending to Gemini
-        # For instance, if you always want this conversion applied to the df before analysis:
-        # print("\n🔄 Applying negative value conversion to 'ppm'/'pct' columns...")
-        # current_df_state = convert_negatives_to_half_positive(current_df_state.copy()) # Use .copy() if you want to preserve original main_df
-        # data_summary = get_data_summary(current_df_state) # Update summary if df changes
-        # print("✅ Conversion applied.")
+
 
         history_str_for_prompt = "\n\n".join(list(conversation_history))
         print("\n🤖 Requesting analysis code from Gemini...")
