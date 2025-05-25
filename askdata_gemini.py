@@ -1,0 +1,235 @@
+from google import genai
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import seaborn as sns
+import numpy as np
+import os
+import re
+import io
+from collections import deque
+from math import radians, sin, cos, sqrt, atan2
+
+# --- Helper Function for Haversine Distance ---
+def haversine_distance(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    r_metres = 6371000 # metres radius of the Earth
+    distance = r_metres * c
+    return distance
+
+# --- Updated Function to Convert Negative Values in Specific Columns ---
+def convert_negatives_to_half_positive(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts negative numerical values to half of their absolute value
+    in columns whose names end with 'ppm' or 'pct' (case-insensitive).
+    For example, -5 becomes 2.5 in a column named 'Gold_ppm'.
+    Modifies the DataFrame in place and returns it.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+
+    Returns:
+        pd.DataFrame: The DataFrame with specified negative values converted.
+    """
+    for col in df.columns:
+        # Check if column is numeric AND its name ends with 'ppm' or 'pct' (case-insensitive)
+        if pd.api.types.is_numeric_dtype(df[col]) and \
+           (col.lower().endswith('ppm') or col.lower().endswith('pct')):
+            # Apply the transformation: where value is negative, replace with abs(value)/2, else keep original
+            df[col] = np.where((pd.notnull(df[col])) & (df[col] < 0), abs(df[col]) / 2, df[col])
+    return df
+
+def get_data_summary(df: pd.DataFrame) -> str:
+    summary_stream = io.StringIO()
+    df.info(buf=summary_stream)
+    info_str = summary_stream.getvalue()
+    lat_col_name = None
+    lon_col_name = None
+    lat_lon_info = ""
+    if 'lat94' in df.columns: lat_col_name = 'lat94'
+    elif any('lat' in col.lower() or col.lower() == 'y' for col in df.columns):
+        possible_lat_cols = [col for col in df.columns if 'lat' in col.lower() or col.lower() == 'northing']
+        lat_lon_info += f"\nPotential Latitude Columns (if 'lat94' not used): {possible_lat_cols}"
+    if 'lng94' in df.columns: lon_col_name = 'lng94'
+    elif any('lon' in col.lower() or 'long' in col.lower() or col.lower() == 'easting' for col in df.columns):
+        possible_lon_cols = [col for col in df.columns if 'lon' in col.lower() or 'lng' in col.lower() or col.lower() == 'x']
+        lat_lon_info += f"\nPotential Longitude Columns (if 'lng94' not used): {possible_lon_cols}"
+    if lat_col_name and lon_col_name: lat_lon_info = f"\nConfirmed Latitude Column: '{lat_col_name}'\nConfirmed Longitude Column: '{lon_col_name}'"
+    elif lat_col_name: lat_lon_info = f"\nConfirmed Latitude Column: '{lat_col_name}' (Longitude 'lng94' not found, please check other potential names if needed)."
+    elif lon_col_name: lat_lon_info = f"\nConfirmed Longitude Column: '{lon_col_name}' (Latitude 'lat94' not found, please check other potential names if needed)."
+    else: lat_lon_info += "\nSpecific 'lat94'/'lng94' columns not found. If other lat/lon columns exist, please specify their names in your query if needed."
+    summary = f"""
+DATA SUMMARY:
+DataFrame Shape: {df.shape}
+Column Information:
+{info_str}{lat_lon_info}
+First 5 rows:
+{df.head().to_string()}
+Basic Descriptive Statistics:
+{df.describe(include='all').to_string()}
+"""
+    for col in df.select_dtypes(include=['object', 'category']).columns:
+        if df[col].nunique() < 20: summary += f"\nUnique values in '{col}': {df[col].unique().tolist()}"
+    return summary
+
+def get_gemini_generated_code(
+    user_question: str, data_summary_for_llm: str, conversation_history_str: str,
+    api_key: str, model_name: str = "gemini-2.5-flash-preview-05-20"
+) -> str:
+    try: client = genai.Client(api_key=api_key)
+    except Exception as e: print(f"# Error initialising Gemini Client: {e}"); return None
+    prompt = f"""
+You are a data analysis assistant. Please use UK English spellings (e.g., colour, analyse) in your responses and generated plot titles and labels.
+A pandas DataFrame named 'df' has been loaded with the following data:
+{data_summary_for_llm}
+CONVERSATION HISTORY (Previous questions and generated code):
+{conversation_history_str if conversation_history_str else "No previous conversation."}
+CURRENT USER QUESTION: "{user_question}"
+Based on the data, conversation history, and the current user's question, generate Python code to perform the requested analysis or create the described plot.
+The code should use the 'df' DataFrame.
+Available Python libraries: pandas (pd), matplotlib.pyplot (plt), matplotlib.ticker (ticker), matplotlib.colors (as mcolors), seaborn (sns), numpy (np).
+Helper functions `haversine_distance(lat1, lon1, lat2, lon2)` (returns distance in metres) and `convert_negatives_to_half_positive(df)` (modifies df to convert negative numbers in columns ending with 'ppm' or 'pct') are available.
+
+Instructions for the generated code:
+1.  If the question asks for a calculation or data subset, print the result or the head of the resulting DataFrame.
+2.  If the question asks for a plot, generate it. Ensure plots have titles and axis labels using UK English.
+    IMPORTANT FOR PLOT AXES (NON-LOG): To ensure X and Y axes (like latitude and longitude) display full numerical values without offset notation,
+    get the current axes using `ax = plt.gca()` and then apply formatters:
+    `ax.xaxis.set_major_formatter(ticker.ScalarFormatter(useOffset=False))`
+    `ax.yaxis.set_major_formatter(ticker.ScalarFormatter(useOffset=False))`
+    IMPORTANT FOR LOGARITHMIC SCALES (Plot Axes and Colour Bars):
+    - When a logarithmic scale is requested for a plot axis (e.g., for 'Au' concentrations in a boxplot, histogram, or scatter plot y-axis) or for a colour bar:
+        1. **Filter Data**: Before applying a log scale to an axis or using `mcolors.LogNorm` for colours, ensure you are working with strictly positive data for the relevant column (e.g., `df_positive = df[df['column_for_log_scale'] > 0]`). Logarithms are undefined for zero or negative values. If no positive data exists for a category or the whole dataset after filtering, you should inform the user and perhaps not generate the log-scaled plot for that part.
+        2. **Apply Logarithmic Transformation**:
+           - For an axis: `ax.set_xscale('log')` or `ax.set_yscale('log')` (applied to the axis object, e.g., from `plt.gca()` or the one returned by `sns.boxplot()`).
+           - For a colour map: use `norm=mcolors.LogNorm(...)` in your plotting command.
+        3. **Format Tick Labels**: Ensure tick labels display original, untransformed numerical values in a readable decimal format (e.g., 0.01, 0.1, 1, 10).
+           - For plot axes (after setting scale to log):
+             `ax.xaxis.set_major_formatter(ticker.ScalarFormatter())`
+             `ax.yaxis.set_major_formatter(ticker.ScalarFormatter())`
+             These formatters should generally show minor ticks appropriately for a log scale if the data range allows.
+             If `ScalarFormatter` still results in scientific notation for numbers where a decimal representation is preferred (e.g., 0.001 might show as 1e-3), you can use `ticker.FormatStrFormatter('%g')` as an alternative:
+             `ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))`
+           - For colour bar tick labels (after `cbar = plt.colorbar(...)`):
+             `cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (For vertical bar)
+             `cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (For horizontal bar)
+             (Adjust '%.2g' format string as needed for precision).
+        4. **Labelling**: Ensure axis and colour bar labels clearly indicate the log scale and original units (e.g., "Gold (Au) (ppm, Log Scale)"). Use UK spelling.
+3.  Consider the conversation history for context if the user asks a follow-up question.
+4.  LOCATION-BASED QUERIES:
+    - Parse target latitude, longitude, and radius (in metres) from the question.
+    - Assume DataFrame has 'lat94' and 'lng94' if 'Confirmed' in DATA SUMMARY.
+    - Create 'distance_to_target' column using `haversine_distance`.
+    - Filter by radius. Example:
+      target_lat = 40.7; target_lon = -73.9; radius_m = 300
+      df['distance_to_target'] = df.apply(lambda row: haversine_distance(row['lat94'], row['lng94'], target_lat, target_lon), axis=1)
+      nearby_samples = df[df['distance_to_target'] <= radius_m]
+      print(f"Found {{len(nearby_samples)}} samples within {{radius_m}}m of ({{target_lat}}, {{target_lon}}):"); print(nearby_samples.head())
+5.  Return ONLY the Python code, without any surrounding text, explanations, or markdown formatting.
+"""
+    try:
+        response = client.models.generate_content(model=model_name, contents=prompt)
+        generated_text = response.text
+        code_match = re.search(r"```python\n(.*?)```", generated_text, re.DOTALL)
+        if code_match: code = code_match.group(1).strip()
+        else:
+            cleaned_text = generated_text.strip()
+            if cleaned_text.lower().startswith("python\n"): cleaned_text = cleaned_text[len("python\n"):].strip()
+            code = cleaned_text
+        # Remove haversine_distance or convert_negatives_to_half_positive if Gemini tries to redefine them
+        code_lines = code.splitlines(); in_helper_def = False; new_code_lines = []
+        helper_defs = ["def haversine_distance(", "def convert_negatives_to_half_positive("]
+        for line in code_lines:
+            stripped_line = line.strip()
+            if any(stripped_line.startswith(h_def) for h_def in helper_defs):
+                in_helper_def = True
+                continue
+            if in_helper_def:
+                if not stripped_line or line.startswith(" ") or line.startswith("\t"):
+                    continue # still inside the helper function body
+                else:
+                    in_helper_def = False # exited helper function body
+            if not in_helper_def:
+                new_code_lines.append(line)
+        code = "\n".join(new_code_lines)
+        return code
+    except Exception as e: print(f"# Error communicating with Gemini API: {e}"); return None
+
+def execute_generated_code(code_to_execute: str, df_data: pd.DataFrame):
+    if not code_to_execute or code_to_execute.strip().startswith("#") or not code_to_execute.strip():
+        print("No valid executable code to run."); return False
+    execution_globals = {
+        'pd': pd, 'plt': plt, 'ticker': ticker, 'sns': sns, 'np': np, 'df': df_data,
+        'haversine_distance': haversine_distance,
+        'convert_negatives_to_half_positive': convert_negatives_to_half_positive, # Make new function available
+        'mcolors': plt.matplotlib.colors
+    }
+    print("\n▶️ Executing Generated Code...\n--------------------------------")
+    try:
+        exec(code_to_execute, execution_globals)
+        if plt.get_fignums(): print("\n🖼️ Displaying generated plot(s)..."); plt.show()
+        else: print("\nℹ️ No plots were generated by the code.")
+        print("--------------------------------\n✅ Code Execution Finished.")
+        return True
+    except Exception as e:
+        print(f"\n❌ Error during execution of generated code:\n{e}\n--------------------------------")
+        return False
+
+if __name__ == "__main__":
+    print("Conversational Geochemistry Data Analyser with Location Awareness (Google Gemini)")
+    print("===============================================================================")
+    print("Type 'exit' to end the conversation.")
+    csv_filepath = input("Enter the path to your geochemistry CSV file: ").strip()
+    if not os.path.exists(csv_filepath): print(f"Error: File not found at '{csv_filepath}'"); exit()
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key: api_key = input("Enter your Google API Key (or set GOOGLE_API_KEY environment variable): ").strip()
+    if not api_key: print("Error: Google API Key is required."); exit()
+
+    default_model_name = "gemini-2.5-flash-preview-05-20"
+    if get_gemini_generated_code.__defaults__: default_model_name = get_gemini_generated_code.__defaults__[0]
+
+    gemini_model_name = input(f"Enter Gemini model name (e.g., {default_model_name}): ").strip()
+    if not gemini_model_name: gemini_model_name = default_model_name; print(f"Using default model: {gemini_model_name}")
+
+    try:
+        print(f"\n🔄 Loading data from '{csv_filepath}'...")
+        main_df = pd.read_csv(csv_filepath)
+        current_df_state = main_df.copy()
+        print(f"✅ Data loaded successfully. Shape: {current_df_state.shape}")
+    except Exception as e: print(f"Error loading CSV file: {e}"); exit()
+
+    data_summary = get_data_summary(main_df)
+    conversation_history = deque(maxlen=5)
+    while True:
+        print("\n" + "-"*50)
+        user_question = input("Ask your geochemistry question (or type 'exit'): ").strip()
+        if user_question.lower() == 'exit': print("Exiting analyser. Goodbye!"); break
+        if not user_question: continue
+
+        # Example of how you might call the new function if needed before sending to Gemini
+        # For instance, if you always want this conversion applied to the df before analysis:
+        # print("\n🔄 Applying negative value conversion to 'ppm'/'pct' columns...")
+        # current_df_state = convert_negatives_to_half_positive(current_df_state.copy()) # Use .copy() if you want to preserve original main_df
+        # data_summary = get_data_summary(current_df_state) # Update summary if df changes
+        # print("✅ Conversion applied.")
+
+        history_str_for_prompt = "\n\n".join(list(conversation_history))
+        print("\n🤖 Requesting analysis code from Gemini...")
+
+        generated_code = get_gemini_generated_code(
+            user_question, data_summary, history_str_for_prompt, api_key, model_name=gemini_model_name
+        )
+
+        if generated_code:
+            print("\n📝 Gemini generated the following Python code:\n----------------------------------------------------")
+            print(generated_code)
+            print("----------------------------------------------------")
+            if execute_generated_code(generated_code, current_df_state):
+                turn_summary = f"User asked: \"{user_question}\"\nAssistant generated code:\n```python\n{generated_code}\n```"
+                conversation_history.append(turn_summary)
+        else: print("Could not generate code from Gemini for this question.")
+    print("\n👋 Analysis session ended.")
