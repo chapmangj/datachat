@@ -72,7 +72,7 @@ def get_gemini_generated_code(
     try: client = genai.Client(api_key=api_key)
     except Exception as e: print(f"# Error initialising Gemini Client: {e}"); return None
     prompt = f"""
-You are a data analysis assistant. Please use UK English spellings (e.g., colour, analyse) in your responses and generated plot titles and labels.
+You are a data analysis assistant. Please use AU/UK English spellings (e.g., colour, analyse) in your responses and generated plot titles and labels.
 A pandas DataFrame named 'df' has been loaded with the following data:
 {data_summary_for_llm}
 CONVERSATION HISTORY (Previous questions and generated code):
@@ -91,22 +91,32 @@ Instructions for the generated code:
     `ax.xaxis.set_major_formatter(ticker.ScalarFormatter(useOffset=False))`
     `ax.yaxis.set_major_formatter(ticker.ScalarFormatter(useOffset=False))`
     IMPORTANT FOR LOGARITHMIC SCALES (Plot Axes and Colour Bars):
-    - When a logarithmic scale is requested for a plot axis (e.g., for 'Au' concentrations in a boxplot, histogram, or scatter plot y-axis) or for a colour bar:
-        1. **Filter Data**: Before applying a log scale to an axis or using `mcolors.LogNorm` for colours, ensure you are working with strictly positive data for the relevant column (e.g., `df_positive = df[df['column_for_log_scale'] > 0]`). Logarithms are undefined for zero or negative values. If no positive data exists for a category or the whole dataset after filtering, you should inform the user and perhaps not generate the log-scaled plot for that part.
+    - When a logarithmic scale is requested for a plot axis (e.g., for 'Au' concentrations) or for a colour bar:
+        1. **Prepare Data for Log Scale**:
+           - Before applying the log scale, the data for the specific column being plotted (let's call it `target_column_name`) needs special handling.
+           - Create a *temporary working copy* of the data from `df[target_column_name]` for plotting. Do NOT modify the original `df` DataFrame unless explicitly asked by the user to do so.
+           - Example for creating and preparing the working copy (e.g., `data_for_log`):
+             `data_for_log = df['target_column_name'].copy()`
+           - **Step 1.1: Handle Zeros**: In `data_for_log`, replace all values equal to `0` with `0.05`.
+             `data_for_log[data_for_log == 0] = 0.05`
+           - **Step 1.2: Handle Specific Negatives**: In `data_for_log`, for values `x` where `-10 <= x < 0`, replace them with `abs(x) / 2`.
+             `neg_condition = (data_for_log >= -10) & (data_for_log < 0)`
+             `data_for_log[neg_condition] = data_for_log[neg_condition].abs() / 2`
+           - **Step 1.3: Filter for Positivity**: After these transformations, the `data_for_log` used for the log scale *must* be strictly positive. Filter out any remaining non-positive values.
+             `data_for_log = data_for_log[data_for_log > 0]`
+           - If `data_for_log` is empty after these steps (e.g., all original values were <= -10 or became non-positive after transformation), inform the user (e.g., print a message) and consider not generating the log-scaled plot or that part of it.
         2. **Apply Logarithmic Transformation**:
-           - For an axis: `ax.set_xscale('log')` or `ax.set_yscale('log')` (applied to the axis object, e.g., from `plt.gca()` or the one returned by `sns.boxplot()`).
-           - For a colour map: use `norm=mcolors.LogNorm(...)` in your plotting command.
-        3. **Format Tick Labels**: Ensure tick labels display original, untransformed numerical values in a readable decimal format (e.g., 0.01, 0.1, 1, 10).
+           - For an axis: `ax.set_xscale('log')` or `ax.set_yscale('log')` (applied to the axis object, using the prepared `data_for_log`).
+           - For a colour map: use `norm=mcolors.LogNorm(...)` (ensure `vmin` and `vmax` for `LogNorm` are derived from the prepared `data_for_log`).
+        3. **Format Tick Labels**: Ensure tick labels display numerical values in a readable decimal format.
            - For plot axes (after setting scale to log):
              `ax.xaxis.set_major_formatter(ticker.ScalarFormatter())`
              `ax.yaxis.set_major_formatter(ticker.ScalarFormatter())`
-             These formatters should generally show minor ticks appropriately for a log scale if the data range allows.
-             If `ScalarFormatter` still results in scientific notation for numbers where a decimal representation is preferred (e.g., 0.001 might show as 1e-3), you can use `ticker.FormatStrFormatter('%g')` as an alternative:
+             If `ScalarFormatter` results in scientific notation where decimal is preferred (e.g., for 0.001), use `ticker.FormatStrFormatter('%g')`:
              `ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))`
            - For colour bar tick labels (after `cbar = plt.colorbar(...)`):
-             `cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (For vertical bar)
-             `cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (For horizontal bar)
-             (Adjust '%.2g' format string as needed for precision).
+             `cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (Vertical bar)
+             `cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.2g'))` (Horizontal bar)
         4. **Labelling**: Ensure axis and colour bar labels clearly indicate the log scale and original units (e.g., "Gold (Au) (ppm, Log Scale)"). Use UK spelling.
 3.  Consider the conversation history for context if the user asks a follow-up question.
 4.  LOCATION-BASED QUERIES:
@@ -114,7 +124,7 @@ Instructions for the generated code:
     - Assume DataFrame has 'lat94' and 'lng94' if 'Confirmed' in DATA SUMMARY.
     - Create 'distance_to_target' column using `haversine_distance`.
     - Filter by radius. Example:
-      target_lat = 40.7; target_lon = -73.9; radius_m = 300
+      target_lat = 140.7; target_lon = -28.9; radius_m = 300
       df['distance_to_target'] = df.apply(lambda row: haversine_distance(row['lat94'], row['lng94'], target_lat, target_lon), axis=1)
       nearby_samples = df[df['distance_to_target'] <= radius_m]
       print(f"Found {{len(nearby_samples)}} samples within {{radius_m}}m of ({{target_lat}}, {{target_lon}}):"); print(nearby_samples.head())
